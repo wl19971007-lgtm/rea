@@ -1,0 +1,96 @@
+name: Sync official REA upstream
+
+on:
+  schedule:
+    # Daily at 09:40 UTC (10:40 Europe/Rome during CET).
+    - cron: "40 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rea-upstream-main-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Safely sync main from morluto/rea
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Compare and sync the official upstream
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const [repository, upstreamRelease] = await Promise.all([
+              github.rest.repos.get({ owner, repo }),
+              github.rest.repos.getLatestRelease({ owner: "morluto", repo: "rea" })
+            ]);
+
+            if (!repository.data.fork || repository.data.parent?.full_name !== "morluto/rea") {
+              core.setFailed("Safety check failed: this repository is not a fork of morluto/rea.");
+              return;
+            }
+
+            const npm = await fetch("https://registry.npmjs.org/rea-agents/latest")
+              .then(async response => {
+                if (!response.ok) throw new Error(`npm registry returned HTTP ${response.status}`);
+                return response.json();
+              })
+              .catch(error => ({ version: "unavailable", npm_error: error.message }));
+
+            const before = await github.rest.repos.getBranch({ owner, repo, branch: "main" });
+            const comparison = await github.request(
+              "GET /repos/{owner}/{repo}/compare/{basehead}",
+              { owner, repo, basehead: "main...morluto:main" }
+            );
+
+            const lines = [
+              "## Official REA upstream sync",
+              "",
+              `- Checked: ${new Date().toISOString()}`,
+              `- Upstream release: ${upstreamRelease.data.tag_name}`,
+              `- Published npm package: ${npm.version}`,
+              `- Fork main before check: ${before.data.commit.sha}`,
+              `- Upstream main: ${comparison.data.commits?.at(-1)?.sha || "same as fork"}`,
+              `- Upstream commits missing from fork: ${comparison.data.ahead_by}`,
+              ""
+            ];
+
+            if (comparison.data.ahead_by === 0) {
+              lines.push("### Result", "", "- Fork main is already current with official upstream main.", "- No write operation was performed.");
+              await core.summary.addHeading("REA upstream sync").addRaw(lines.join("\n")).write();
+              return;
+            }
+
+            try {
+              const synced = await github.request(
+                "POST /repos/{owner}/{repo}/merge-upstream",
+                { owner, repo, branch: "main" }
+              );
+              const after = await github.rest.repos.getBranch({ owner, repo, branch: "main" });
+              lines.push(
+                "### Result",
+                "",
+                `- Sync result: ${synced.data.merge_type}`,
+                `- GitHub response: ${synced.data.message}`,
+                `- Fork main after sync: ${after.data.commit.sha}`,
+                "- Source: official morluto/rea main.",
+                "- No force-push was used."
+              );
+              await core.summary.addHeading("REA upstream sync").addRaw(lines.join("\n")).write();
+              core.notice(`REA fork synced from upstream using ${synced.data.merge_type}.`);
+            } catch (error) {
+              lines.push(
+                "### Result",
+                "",
+                "- Automatic sync did not complete.",
+                `- Error: ${error.message}`,
+                "- No force-push or conflict overwrite was attempted.",
+                "- Resolve the conflict or API permission issue before the next sync."
+              );
+              await core.summary.addHeading("REA upstream sync — attention required").addRaw(lines.join("\n")).write();
+              core.setFailed(`REA upstream sync failed safely: ${error.message}`);
+            }
